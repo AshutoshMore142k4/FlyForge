@@ -6,3 +6,8 @@ __pycache__/
 .pytest_cache/
 *.mp4
 runs/
+
+# Demo-only art (Claude Artifact previews), not part of the package. Excluded
+# deliberately: the fly image is a watermarked Vecteezy stock photo with no
+# redistribution license -- do not commit it to this public repo.
+assets/

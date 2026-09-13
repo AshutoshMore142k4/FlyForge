@@ -1,19 +1,40 @@
 # FlyForge
 
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)
+![Data: CC BY 4.0](https://img.shields.io/badge/data-CC%20BY%204.0-lightgrey.svg)
+![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)
+![GitHub last commit](https://img.shields.io/github/last-commit/AshutoshMore142k4/FlyForge)
+![GitHub stars](https://img.shields.io/github/stars/AshutoshMore142k4/FlyForge?style=social)
+
 An embodied simulation of the *Drosophila* connectome: a real fly nervous system
 wired into a physics-simulated body, in a world it has to survive in.
 
 The question is not "can this hit a benchmark" but **what does the connectome
 actually do when you embed it in a world?**
 
-## Status
-
-Phase 1 complete — the sensorimotor loop closes end to end with a baseline brain.
-The connectome is not wired in yet.
-
 ```
 odor  →  brain  →  descending drive  →  CPG  →  legs  →  world  ↺
 ```
+
+## Contents
+
+- [Status](#status)
+- [Architecture](#architecture)
+- [Install](#install)
+- [Run](#run)
+- [Layout](#layout)
+- [Connectome data](#connectome-data)
+- [Roadmap](#roadmap)
+- [Design notes](#design-notes)
+- [Credits](#credits)
+
+## Status
+
+🟢 **Phase 1** — sensorimotor loop closes end to end, klinotaxis baseline.
+🟡 **Phase 3** — `ConnectomeBrain` builds and runs on the real 164k-neuron MaleCNS
+graph (GPU sparse CSR), but is unverified: no dedicated tests yet, and not wired
+into the CLI. Treat it as a working prototype, not a finished feature.
 
 ## Architecture
 
@@ -29,8 +50,8 @@ produces two numbers.
               │  2 odor dims × 4 sensors (2 antennae, 2 maxillary palps)
               ▼
     ┌──────────────────────────────┐
-    │  Brain                       │   StubBrain today,
-    │  odor (2,4) → action (2,)    │   ConnectomeBrain next
+    │  Brain                       │   StubBrain (shipped)
+    │  odor (2,4) → action (2,)    │   ConnectomeBrain (prototype)
     └──────────────┬───────────────┘
                    ▼
      HybridTurningController → CPG → legs → world
@@ -66,13 +87,20 @@ and drifts back out — pure klinotaxis with no arrest term. That is a real prop
 the controller, not a bug, and it is what `ConnectomeBrain` has to beat.
 Throughput is ~670 steps/s (timestep 1e-4, so roughly 15x slower than real time).
 
+```powershell
+python -c "from flyforge.connectome import build_graph; g = build_graph(); print(g.n_neurons, 'neurons')"
+```
+
+builds (or loads the cached) whole-CNS graph — 164,481 neurons, ~23.3M signed edges —
+in a couple of seconds once the data is downloaded.
+
 ## Layout
 
 | File | What |
 |---|---|
 | `flyforge/world.py` | arena, fly, odor sources; flygym wrapper |
-| `flyforge/brain.py` | `Brain` protocol + `StubBrain` klinotaxis baseline |
-| `flyforge/connectome.py` | MaleCNS v1.0 download + (next) sparse graph build |
+| `flyforge/brain.py` | `Brain` protocol, `StubBrain`, `ConnectomeBrain` (prototype) |
+| `flyforge/connectome.py` | MaleCNS v1.0 download + sparse graph build |
 | `flyforge/run.py` | the closed loop + CLI |
 | `tests/test_loop.py` | smoke tests; pins the sensor-side assumption |
 
@@ -99,12 +127,17 @@ token needed. MaleCNS v1.0 is CC-BY 4.0 (Janelia FlyEM / Google Research / MRC L
 `body-stats`) is deliberately not downloaded — a connectivity-driven rate model never
 reads it.
 
+`ConnectomeBrain` signs each edge from its presynaptic neuron's predicted
+neurotransmitter (ACh/Glu → excitatory, GABA → inhibitory), row-normalises the
+resulting sparse matrix, and injects odor drive at ORN rows / reads steering out at DN
+rows — the whole graph runs on GPU, not just a hop-limited subgraph.
+
 ## Roadmap
 
 - [x] **0** Environment
 - [x] **1** Closed loop, stub brain, tests
-- [ ] **2** MaleCNS download + schema *(downloader done)*
-- [ ] **3** `ConnectomeBrain`: ORN → AL → MB/LH → DN, sparse signed weights on GPU
+- [x] **2** MaleCNS download + schema
+- [ ] **3** `ConnectomeBrain` — builds and runs; needs tests + CLI wiring + behavioural tuning
 - [ ] **4** Survival: energy, food, death
 - [ ] **5** Plasticity, and the comparison the project exists to make:
       connectome fixed / connectome + plasticity / **degree-matched shuffle** /
@@ -126,9 +159,9 @@ Vision is what forces WSL2, so it comes last.
 behavioural question. Spiking multiplies cost and tuning burden before there is any
 behaviour to explain.
 
-**The GPU is not the constraint.** 176k neurons and ~6.3M thresholded connections is
-well under 100 MB as sparse CSR. The hard part is the sensory and motor *mapping* —
-which neurons the sensors drive, and how activity becomes movement.
+**The GPU is not the constraint.** 164k neurons and ~23M edges is well under 200 MB as
+sparse CSR. The hard part is the sensory and motor *mapping* — which neurons the
+sensors drive, and how activity becomes movement.
 
 ## Credits
 

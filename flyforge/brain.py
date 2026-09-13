@@ -8,6 +8,9 @@ drive joints directly.
 from typing import Protocol
 
 import numpy as np
+import torch
+
+from flyforge.connectome import build_graph
 
 # Sensor layout of obs["odor_intensity"], shape (k_dims, 4).
 # Verified against flygym's fly.olfaction_sensor_positions -- see tests/test_loop.py.
@@ -80,3 +83,92 @@ class StubBrain:
         turn = self.gain * asym
         action = np.array([self.base_drive - turn, self.base_drive + turn])
         return np.clip(action, self.min_drive, 1.0)
+
+
+class ConnectomeBrain:
+    """A leaky-relu rate model run over the real MaleCNS whole-CNS graph.
+
+    Odor drive is injected uniformly across each side's ORN rows, integrated for
+    a few sub-steps, then read out as the DN-left/DN-right activity difference --
+    the same "stronger side gets the lower drive" convention as StubBrain, so the
+    two brains are directly comparable.
+
+    tau/dt/k_substeps/input_gain/readout_gain/min_weight/min_nt_confidence are
+    calibration knobs, not derived constants -- there is no ground truth for how
+    an odor-scalar should map to ORN firing rate, so these are chosen for stable,
+    steerable dynamics rather than fit to real firing-rate data.
+    """
+
+    def __init__(
+        self,
+        tau: float = 0.05,
+        dt: float = 0.01,
+        k_substeps: int = 10,
+        input_gain: float = 5.0,
+        readout_gain: float = 20.0,
+        base_drive: float = 1.0,
+        min_weight: int = 1,
+        min_nt_confidence: float = 0.5,
+        device: str | None = None,
+        seed: int | None = None,
+    ):
+        self.tau = tau
+        self.dt = dt
+        self.k_substeps = k_substeps
+        self.input_gain = input_gain
+        self.readout_gain = readout_gain
+        self.base_drive = base_drive
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # seed: kept for API symmetry with StubBrain / future stochastic init
+        # (e.g. noisy r0); the model itself is deterministic given odor input.
+        self._rng = np.random.default_rng(seed)
+
+        graph = build_graph(min_weight=min_weight, min_nt_confidence=min_nt_confidence)
+        self.n_neurons = graph.n_neurons
+        self.W = graph.W.to(self.device)
+        self.orn_left = graph.orn_left.to(self.device)
+        self.orn_right = graph.orn_right.to(self.device)
+        self.dn_left = graph.dn_left.to(self.device)
+        self.dn_right = graph.dn_right.to(self.device)
+        self.r = torch.zeros(self.n_neurons, device=self.device)
+
+    def reset(self) -> None:
+        self.r = torch.zeros(self.n_neurons, device=self.device)
+
+    def step(self, odor: np.ndarray) -> np.ndarray:
+        odor = np.atleast_2d(np.asarray(odor, dtype=np.float64))
+        w = _valence(odor.shape[0])
+        per_sensor = w @ odor
+        left = float(per_sensor[list(LEFT_SENSORS)].sum())
+        right = float(per_sensor[list(RIGHT_SENSORS)].sum())
+
+        # flygym's odor sensor is per-side, not per-glomerulus, so we inject the
+        # same pooled scalar into every ORN on that side -- split evenly across
+        # that side's ORN count so a side's *total* injected drive tracks the
+        # odor reading, not how many ORNs of that side happen to be traced (the
+        # reconstruction has 884 left vs 1344 right ORNs; injecting the raw
+        # scalar per-neuron would let that count mismatch alone bias steering).
+        # ponytail: real ORNs are glomerulus-specific (each responds to one
+        # receptor type); upgrade path is per-glomerulus deconvolution if flygym
+        # ever exposes per-receptor-type readings instead of one pooled scalar.
+        i_ext = torch.zeros(self.n_neurons, device=self.device)
+        if len(self.orn_left):
+            i_ext[self.orn_left] = left * self.input_gain / len(self.orn_left)
+        if len(self.orn_right):
+            i_ext[self.orn_right] = right * self.input_gain / len(self.orn_right)
+
+        alpha = self.dt / self.tau
+        r = self.r
+        for _ in range(self.k_substeps):
+            drive = torch.sparse.mm(self.W, r.unsqueeze(1)).squeeze(1) + i_ext
+            r = r + alpha * (-r + torch.relu(drive))
+        self.r = r
+
+        dn_l = r[self.dn_left].mean() if len(self.dn_left) else torch.zeros((), device=self.device)
+        dn_r = r[self.dn_right].mean() if len(self.dn_right) else torch.zeros((), device=self.device)
+
+        # Same convention as StubBrain: higher drive on a side turns the fly away
+        # from it, so the stronger (here: more DN-active) side gets the lower drive.
+        turn = float(torch.tanh(self.readout_gain * (dn_l - dn_r)))
+        action = np.array([self.base_drive - turn, self.base_drive + turn])
+        return np.clip(action, -0.5, 1.5)
